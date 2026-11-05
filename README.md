@@ -1,12 +1,15 @@
 # MTG Simple Playtest Maker
-Print Clean, Legible MTG Playtest Cards from an input List
+Print Clean, Legible MTG Playtest Cards.
 
-run the mtg_test_cards.py
-input a list of cards and their quantities. Double faced cards should only require the first card title to be written to be printed
+Instructions:
+1. run the mtg_test_cards.py
+2. input a list of cards and their quantities.
+3. select a paper type and output path.
+4. press f5 for it to generate. it will pull the scryfall database first if it hasn't.
+5. review, print, and cut!
+6. I also have a corner rounder thingy I use to make them closer to the actual cards appearance.
 
-press f5 for it to generate. it will pull the scryfall database first if it hasn't
-
-im easy to find, lemme know if there's something wrong with the way it handles a specific card or card type.\
+im easy to find, lemme know if there's something wrong with the way it handles a specific card or card type.
 
 cheers!
 
