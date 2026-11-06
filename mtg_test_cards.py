@@ -20,6 +20,7 @@ Dependencies: Python 3.8+ and reportlab (a pure-Python copy is bundled in
 ./vendor if you don't have it installed).
 """
 
+import difflib
 import glob
 import gzip
 import json
@@ -57,6 +58,7 @@ MM = 72.0 / 25.4                      # points per millimetre
 CARD_W = 63 * MM                      # Magic card width  (178.4 pt)
 CARD_H = 88 * MM                      # Magic card height (249.3 pt)
 MAX_PER_PAGE = 9                      # hard cap: 3 x 3 grid
+QTY_NOTE_ABOVE = 20                   # warn above this per-line quantity
 
 PAPER_SIZES = {
     'US Letter (8.5 x 11 in)': (612.0, 792.0),
@@ -76,6 +78,7 @@ BULK_LIST_URL = 'https://api.scryfall.com/bulk-data'
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(HERE, 'scryfall_oracle_cache.jsonl.gz')
+SETTINGS_PATH = os.path.join(HERE, 'mtg_test_cards_settings.json')
 
 
 def downloads_dir():
@@ -125,6 +128,7 @@ TYPE_FONT, TYPE_SIZE = 'Helvetica-Oblique', 9.0
 TEXT_FONT, TEXT_SIZE = 'Helvetica', 12.5
 STAT_FONT, STAT_SIZE = 'Helvetica-Bold', 11.5
 MIN_TEXT = 6.0                        # nothing ever renders smaller than this
+FIT_EPS = 1e-6                        # pt, float-noise slack at an exact fit
 
 # Card face layout (mm from the top edge of the card). Like a real Magic
 # card, each face has a solid black border right at its edge; the zones
@@ -146,6 +150,93 @@ Z_TEXT_BOT = 79.4      # rule below the text box (top of the stat zone)
 # stat zone: Z_TEXT_BOT .. (88 - MARGIN_MM)
 PAD_X = (MARGIN_MM + 0.4) * MM   # horizontal padding for text inside the border
 LINE_W = 1.0           # pt, weight of the separating rules
+
+# ---------------------------------------------------------------------------
+# Card layouts (https://scryfall.com/docs/api/layouts)
+#
+# `layout` - NOT the mere presence of card_faces - decides how much physical
+# cardstock a card needs and what frame its text sits in.  Scryfall uses
+# card_faces for several one-sided layouts (split, flip, adventure, prepare),
+# so counting faces is not a valid way to decide how many cards to print.
+#
+# Only these layouts are physically double sided -> two printed items:
+DOUBLE_SIDED_LAYOUTS = ('transform', 'modal_dfc', 'double_faced_token',
+                        'art_series', 'reversible_card')
+# Two spells on ONE face, the lower half printed upside down (real split cards
+# and flip cards): one printed item with a custom half-face frame.
+HALF_FACE_LAYOUTS = ('split', 'flip')
+# One face carrying an inset sub-panel in the text box (Adventure / Prepared
+# spell): one printed item, main spell plus a small framed sub-box.
+INSET_PANEL_LAYOUTS = ('adventure', 'prepare')
+# One face whose rules text is printed as stacked sub-boxes inside the normal
+# text box (levelers, Classes, Cases, Sagas): one printed item, custom frame.
+STACKED_PANEL_LAYOUTS = ('leveler', 'class', 'case', 'saga')
+
+# Corner labels for single-face frames that a plain card would misread.
+LAYOUT_MARKERS = {
+    'token': 'TOKEN', 'emblem': 'EMBLEM', 'planar': 'PLANE',
+    'scheme': 'SCHEME', 'vanguard': 'VANGUARD', 'front_card': 'DECK INDICATOR',
+    'host': 'HOST', 'augment': 'AUGMENT', 'art_series': 'ART SERIES',
+    'prototype': 'PROTOTYPE', 'mutate': 'MUTATE', 'meld': 'MELD PART',
+}
+
+# Geometry of the custom frames (mm / font scale).
+HALF_DIVIDER_MM = 44.0   # divider under the upper half (just above the type band)
+HALF_SCALE = 0.62        # font scale inside a half face
+INSET_W_MM, INSET_H_MM = 34.0, 18.0   # Adventure / Prepared sub-panel
+INSET_SCALE = 0.70                   # font scale inside the sub-panel
+PANEL_PAD_MM = 1.2                   # preferred white above a stacked-panel divider
+MIN_PANEL_PAD_MM = 0.5               # ...shrunk to this only if text will not fit
+PANEL_HDR_SCALE = 0.80               # font scale of a panel header ("I, II -")
+PANEL_HDR_EXTRA_MM = 0.4             # white under a panel header
+PANEL_BODY_PAD_MM = 0.3              # padding inside a stacked-panel body
+
+# Zone offsets for the scaled-down faces of split/flip cards, in mm measured
+# from the top of the half (real split halves keep a full-size name row and a
+# short text box, so these are absolute rather than a scale of Z_*).
+MINI_NAME_LINE = 8.0     # rule under the name row
+MINI_TYPE_TOP = 23.5     # rule above the type band
+MINI_TYPE_BOT = 29.5     # rule below the type band (top of the half's text box)
+MINI_TEXT_BOT = 1.5      # bottom rule, measured up from the half's bottom edge
+
+
+def load_settings():
+    """Saved GUI preferences ({'paper_size':…, 'output_path':…}) or {} if absent.
+
+    Stored as JSON next to the script (SETTINGS_PATH). Values that no longer
+    make sense are dropped - a paper size that is not in PAPER_SIZES, a blank
+    path - so an edited or half-written file can never break startup. A broken
+    file simply means defaults.
+    """
+    try:
+        with open(SETTINGS_PATH, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    prefs = {}
+    paper = data.get('paper_size')
+    if isinstance(paper, str) and paper in PAPER_SIZES:
+        prefs['paper_size'] = paper
+    path = data.get('output_path')
+    if isinstance(path, str) and path.strip():
+        prefs['output_path'] = path.strip()
+    return prefs
+
+
+def save_settings(paper_size=None, output_path=None):
+    """Remember GUI preferences next to the script (best effort, never raises)."""
+    data = load_settings()   # only valid, known keys survive a rewrite
+    if paper_size in PAPER_SIZES:
+        data['paper_size'] = paper_size
+    if output_path and output_path.strip():
+        data['output_path'] = output_path.strip()
+    try:
+        with open(SETTINGS_PATH, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=1)
+    except OSError:
+        pass  # a read-only folder must not break generation
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +359,8 @@ def load_database(path=CACHE_PATH):
                 'power': c.get('power'),
                 'toughness': c.get('toughness'),
                 'loyalty': c.get('loyalty'),
+                # Battle-type cards print a defense value instead of P/T.
+                'defense': c.get('defense'),
                 'oracle_text': (c.get('oracle_text') or '').strip(),
                 'layout': c.get('layout') or 'normal',
                 # Two-faced cards (split, flip, transform, adventure,
@@ -283,7 +376,11 @@ def load_database(path=CACHE_PATH):
                         'power': f.get('power'),
                         'toughness': f.get('toughness'),
                         'loyalty': f.get('loyalty'),
+                        'defense': f.get('defense'),
                         'oracle_text': (f.get('oracle_text') or '').strip(),
+                        # Reversible cards nest two unrelated printings, each
+                        # with its own layout.
+                        'layout': f.get('layout') or '',
                     }
                     for f in (c.get('card_faces') or [])
                 ],
@@ -329,6 +426,55 @@ split card and still get the whole card printed. Exact face-name matches
     if cands is None:
         cands = idx.get(_norm(name))
     return list(cands) if cands else []
+
+
+SUGGEST_MAX = 4                     # spell suggestions offered per bad name
+SUGGEST_CUTOFF = 0.75               # difflib similarity for a near match
+_NAME_INDEX = {}                    # id(db) -> (db, ([keys], {key: name}))
+
+
+def _name_index(db):
+    """Cache ([normalized keys], {key: display name}) for spell suggestions.
+
+    Built lazily once per database object, like _face_index; the stored db
+    reference means a recycled id() can never serve a stale index.
+    """
+    hit = _NAME_INDEX.get(id(db))
+    if hit is not None and hit[0] is db:
+        return hit[1]
+    names = {key: cands[0]['name'] for key, cands in db.items()}
+    idx = (list(names), names)
+    _NAME_INDEX[id(db)] = (db, idx)
+    return idx
+
+
+def _suggest_names(db, name, n=SUGGEST_MAX):
+    """Up to *n* card names closest to *name*, for a line that matched nothing.
+
+    difflib over the ~38,700 normalized keys costs ~0.1 s per query, but only
+    runs on the error path (a name that neither the main index nor any face
+    name resolved), so a normal deck list never pays it.
+    """
+    key = _norm(name) or name.casefold()
+    if len(key) < 3:
+        return []      # punctuation-only names have no meaningful near match
+    keys, names = _name_index(db)
+    out = []
+    for hit in difflib.get_close_matches(key, keys, n=n,
+                                        cutoff=SUGGEST_CUTOFF):
+        disp = names.get(hit)
+        if disp and disp not in out:
+            out.append(disp)
+    return out
+
+
+def _suggest_text(db, name):
+    """' Did you mean …?' tail for the 'no card found' message ('' if none)."""
+    tips = _suggest_names(db, name)
+    if not tips:
+        return ''
+    shown = ', '.join('\u201c%s\u201d' % t for t in tips)
+    return f' Did you mean {shown}?'
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +539,8 @@ def resolve(entries, db):
         if not cands:
             problems.append(
                 f'line {lineno}: \u201c{name}\u201d (x{qty}): no card with this '
-                'name was found. Please check the spelling.')
+                'name was found. Please check the spelling.' +
+                _suggest_text(db, name))
             continue
         typed = name.casefold()
         hit = next((c for c in cands if c['name'].casefold() == typed), None)
@@ -415,41 +562,159 @@ def resolve(entries, db):
 # ---------------------------------------------------------------------------
 def _base_item(src):
     """Copy the printable fields of a card/face record into a new item."""
-    return {k: src[k] for k in ('name', 'mana_cost', 'type_line', 'power',
-                                'toughness', 'loyalty', 'oracle_text')}
+    return {k: src.get(k) for k in ('name', 'mana_cost', 'type_line', 'power',
+                                    'toughness', 'loyalty', 'defense',
+                                    'layout', 'oracle_text')}
 
 
-def expand_items(cards, db):
+_PANEL_HEADERS = {          # regexes marking the start of a stacked sub-box
+    'leveler': re.compile(r'^LEVEL\b'),
+    'class': re.compile(r'^(?:\{[^}]*\}\s*)+:\s*Level\s+\d|^Level\s+\d'),
+    'case': re.compile(r'^(To solve|Solved)\s*\u2014'),
+    # Sagas also print merged chapters ("I, II \u2014 ..."): one panel each.
+    'saga': re.compile(r'^(?:[IVX]{1,3}(?:\s*,\s*[IVX]{1,3})*)\s*\u2014'),
+}
+
+
+# Panel headings are printed bold and on their own line, so only the SHORT
+# label part of a matching line may go in the heading: saga chapters ("I, II
+# — ..."), Cases ("To solve — ...") and Class levels carry rules text on the
+# same source line, which must fold into that panel's wrapped body.
+_PANEL_LABEL = {
+    'saga': re.compile(r'^((?:[IVX]{1,3}(?:\s*,\s*[IVX]{1,3})*)\s*\u2014)'
+                       r'\s*(.*)$', re.DOTALL),
+    'case': re.compile(r'^((?:To solve|Solved)\s*\u2014)\s*(.*)$', re.DOTALL),
+}
+
+
+def split_panels(text, kind):
+    """Split one card's rules text into the stacked sub-boxes a real card prints.
+
+    Returns [(label, body), ...]; an empty label means the unlabelled intro
+    panel.  This only decides how the standard text box gets divided - the
+    standard text box itself (fonts, wrapping, justification) is untouched.
+    """
+    hdr = _PANEL_HEADERS.get(kind)
+    if not hdr or not text:
+        return [('', text or '')]
+    out, label, body = [], '', []
+    for ln in text.split('\n'):
+        s = ln.strip()
+        if hdr.match(s):
+            if label or body:
+                out.append((label, '\n'.join(body).strip()))
+            lab, rest = _panel_label(kind, s)
+            label, body = lab, ([rest] if rest else [])
+        else:
+            body.append(ln)
+    if label or body:
+        out.append((label, '\n'.join(body).strip()))
+    panels = [(a, b) for a, b in out if a or b]
+    return panels or [('', text)]
+
+
+def _panel_label(kind, line):
+    """Split a panel's first source line into (bold label, remaining text).
+
+    Lines that are entirely a label (LEVEL 2+, {3}{U}: Level 3) keep their
+    whole text in the heading; lines with an em-dash label keep only the label
+    there and return the rest so it can be wrapped as body text.
+    """
+    m = _PANEL_LABEL.get(kind)
+    if m:
+        g = m.match(line)
+        if g:
+            return g.group(1).strip(), g.group(2).strip()
+    return line, ''
+
+
+def expand_items(cards, db, notes=None):
     """Expand resolved cards into the flat list of card faces to print.
 
-    Scryfall's layouts fall into three groups:
+    The Scryfall `layout` field decides everything (see docs/api/layouts);
+    counting card_faces does NOT: split, flip, adventure and prepare cards
+    carry two card_faces but live on ONE piece of cardstock.
 
-    * Two physical faces (split, flip, transform, adventure, prepare,
-      art_series, two-faced tokens): each face is printed as its own test
-      card, tagged FRONT / BACK so you know which side of the real card it
-      is. Token faces additionally carry a TOKEN marker.
-    * Melds: a meld part is one physical card whose back is the melded
-      result; both are printed (part tagged MELD PART, result tagged MELD
-      RESULT). A meld result typed on its own prints alone.
-    * Everything else (normal, saga, class, case, leveler, vanguard,
-      planar, scheme, emblem, mutate, prototype, augment, host, token,
-      front_card): one face in the standard frame; tokens and deck
-      indicators get a small corner marker.
+    * DOUBLE_SIDED_LAYOUTS (transform, modal_dfc, double_faced_token,
+      art_series, reversible_card) - two physical sides -> the ONLY layouts
+      that print two items, tagged FRONT / BACK.
+    * HALF_FACE_LAYOUTS (split, flip) - two spells on one face, the lower one
+      printed upside down: ONE item with a custom half-face frame.
+    * INSET_PANEL_LAYOUTS (adventure, prepare) - main spell plus an inset
+      sub-panel for the Adventure/Prepared spell: ONE item, custom frame.
+    * STACKED_PANEL_LAYOUTS (leveler, class, case, saga) - one face whose
+      rules text is printed as stacked sub-boxes: ONE item, custom frame.
+    * meld - a meld part carries the melded result on its physical back, so
+      part + result are two items; a meld result typed alone prints once and
+      the auto-added result prints only once even when both halves of the
+      meld pair are typed, or when the same card was also typed directly.
+    * Everything else (normal, mutate, prototype, token, emblem, planar,
+      scheme, vanguard, host, augment, front_card) - ONE item in the standard
+      frame, with a corner marker where the frame would otherwise be ambiguous.
+
+    `notes` (optional list) collects remarks about cards whose data cannot be
+    reproduced faithfully (more than two halves, a missing meld result, ...).
     """
     items = []
+    meld_results = set()      # results already printed by an earlier part
+    typed_names = {_norm(c['name']) for c in cards}
     for card in cards:
         layout = card.get('layout') or 'normal'
         faces = card.get('faces') or []
 
-        if len(faces) >= 2:
-            token_marker = ('TOKEN' if layout in (
-                'token', 'double_faced_token', 'two-faced_token') else None)
-            for i, face in enumerate(faces):
+        if layout in DOUBLE_SIDED_LAYOUTS and len(faces) >= 2:
+            marker = ('TOKEN' if layout == 'double_faced_token' else
+                      'ART SERIES' if layout == 'art_series' else None)
+            for i, face in enumerate(faces[:2]):
                 item = _base_item(face)
-                if token_marker:
-                    item['marker'] = token_marker
+                if layout == 'art_series':
+                    # Art series sides are art + name only: no type line.
+                    item['type_line'] = ''
+                if marker:
+                    item['marker'] = marker
                 item['face_tag'] = 'FRONT' if i == 0 else 'BACK'
                 items.append(item)
+            if len(faces) > 2 and notes is not None:
+                notes.append(
+                    f'\u201c{card["name"]}\u201d nests {len(faces)} faces but a '
+                    'test card has two sides; only the first two are printed.')
+            continue
+
+        if layout in HALF_FACE_LAYOUTS and len(faces) >= 2:
+            if len(faces) > 2:
+                # The authentic frame puts exactly two spells on one face; a
+                # joke card with more halves would be unreadable crammed in,
+                # so every spell gets its own legible card instead of the
+                # extras being dropped (a playtest deck still needs them all).
+                prefix = 'SPLIT' if layout == 'split' else 'FLIP'
+                for i, face in enumerate(faces):
+                    item = _base_item(face)
+                    item['marker'] = f'{prefix} {i + 1}/{len(faces)}'
+                    item['face_tag'] = f'{i + 1}/{len(faces)}'
+                    items.append(item)
+                if notes is not None:
+                    notes.append(
+                        f'\u201c{card["name"]}\u201d has {len(faces)} halves; the '
+                        'two-halves frame cannot hold them, so each spell prints '
+                        'as its own card.')
+                continue
+            item = _base_item(card)
+            item['frame'] = 'half'
+            item['parts'] = [_base_item(f) for f in faces[:2]]
+            items.append(item)
+            continue
+
+        if layout in INSET_PANEL_LAYOUTS and len(faces) >= 2:
+            item = _base_item(faces[0])            # main spell
+            item['inset'] = _base_item(faces[1])   # Adventure / Prepared panel
+            items.append(item)
+            continue
+
+        if layout in STACKED_PANEL_LAYOUTS:
+            item = _base_item(card)
+            item['frame'] = 'panels'
+            item['panels'] = split_panels(item.get('oracle_text'), layout)
+            items.append(item)
             continue
 
         item = _base_item(card)
@@ -466,12 +731,23 @@ def expand_items(cards, db):
                 items.append(item)
                 cands = (db.get(_norm(result_name)) or
                          db.get(result_name.casefold()))
-                if cands:
+                if cands and _norm(result_name) not in meld_results | typed_names:
+                    # Both halves of a meld pair name the same result; one
+                    # physical copy of it is enough.  An explicitly typed
+                    # result card is untouched, so typing it twice still
+                    # prints two copies.
                     res = _base_item(cands[0])
                     res['marker'] = 'MELD RESULT'
                     items.append(res)
+                    meld_results.add(_norm(result_name))
+                elif not cands and notes is not None:
+                    notes.append(
+                        f'\u201c{card["name"]}\u201d melds with \u201c{result_name}\u201d, '
+                        'which was not found in the database.')
                 continue
             item['marker'] = 'MELD RESULT'
+        elif LAYOUT_MARKERS.get(layout):
+            item['marker'] = LAYOUT_MARKERS[layout]
         items.append(item)
     return items
 
@@ -561,8 +837,8 @@ def truncate_to_fit(text, font, size, width):
     if pdfmetrics.stringWidth(text, font, size) <= width:
         return text
     ell = '\u2026'
-    while len(text) > 1 and \
-            pdfmetrics.stringWidth(text[:-1].rstrip() + ell, font, size) > width:
+    while text and \
+            pdfmetrics.stringWidth(text + ell, font, size) > width:
         text = text[:-1]
     out = text.rstrip() + ell
     return out if pdfmetrics.stringWidth(out, font, size) <= width else ell
@@ -574,7 +850,9 @@ def fit_name_cost(name, cost, lw):
     The name keeps its maximum size as long as possible; the cost is only
     shrunk when there is not enough room for it at its maximum size, so the
     two can never overlap. Only absurdly long names (a joke card or two)
-    need the last resort: shrinking to 3 pt and shortening with an ellipsis.
+    need the last resort, and that last resort still respects MIN_TEXT:
+    the name stops at 6 pt and is shortened with an ellipsis there, so
+    nothing in a name row ever renders below the documented floor.
 
     Returns (name_size, cost_size_or_None, name_text).
     """
@@ -584,29 +862,385 @@ def fit_name_cost(name, cost, lw):
         return nsize, None, truncate_to_fit(name, NAME_FONT, nsize, lw)
     c_floor_w = pdfmetrics.stringWidth(cost, COST_FONT, MIN_TEXT)
     nsize = float(NAME_SIZE)
-    while nsize > 3.0:
+    while nsize > MIN_TEXT:
         c_avail = lw - pdfmetrics.stringWidth(name, NAME_FONT, nsize) - gap
         if c_avail >= c_floor_w:
             return (nsize,
                     fit_font_size(cost, COST_FONT, COST_SIZE, MIN_TEXT, c_avail),
                     name)
         nsize -= 0.5
-    # last resort: below the normal floor, and shorten the name if needed
-    c_avail = lw - pdfmetrics.stringWidth(name, NAME_FONT, 3.0) - gap
-    if c_avail >= c_floor_w:
-        return 3.0, fit_font_size(cost, COST_FONT, COST_SIZE, MIN_TEXT, c_avail), name
-    ntext = truncate_to_fit(name, NAME_FONT, 3.0,
-                            lw - gap - c_floor_w)
-    rest = lw - pdfmetrics.stringWidth(ntext, NAME_FONT, 3.0) - gap
-    return 3.0, fit_font_size(cost, COST_FONT, COST_SIZE, MIN_TEXT, rest), ntext
+    # last resort at the floor: the cost still needs its minimum room, so the
+    # name is shortened instead of shrinking below MIN_TEXT.
+    ntext = truncate_to_fit(name, NAME_FONT, MIN_TEXT,
+                            max(lw - gap - c_floor_w, 1.0))
+    rest = lw - pdfmetrics.stringWidth(ntext, NAME_FONT, MIN_TEXT) - gap
+    return (MIN_TEXT,
+            fit_font_size(cost, COST_FONT, COST_SIZE, MIN_TEXT, rest), ntext)
+
+
+def _note_short_name(warnings, name, ntext):
+    """Record a name that had to be shortened with an ellipsis."""
+    if warnings is not None and ntext != name:
+        warnings.append(('name shortened', name))
+
+
+# ---------------------------------------------------------------------------
+# Text blocks and custom frames
+#
+# draw_text_block is the one standard text-box renderer: word-wrap, shrink to
+# fit (never below MIN_TEXT), vertically center, visibly cut off with an
+# ellipsis if it still overflows.  Standard cards call it with the standard
+# zone bounds, so their text box is exactly as specified in SPEC.md 6.3; the
+# custom frames below only hand it smaller sub-boxes of their own.
+# ---------------------------------------------------------------------------
+def draw_text_block(c, lx, width, box_top, box_bot, text, name,
+                    truncated=None, font=TEXT_FONT, max_size=TEXT_SIZE,
+                    min_size=MIN_TEXT, pad_mm=1.0):
+    """Wrap *text* into the band between *box_top* and *box_bot* (points).
+
+    Shrinks from *max_size* down to *min_size* until the wrapped block fits,
+    centers it vertically inside the band and draws every line left-aligned.
+    If it still does not fit at *min_size*, only the lines that fit are kept
+    and the last one is cut with an ellipsis (a ('rules text cut off',
+    *name*) pair is recorded in *truncated*).  Nothing ever renders below
+    *min_size* except that cut.
+    """
+    face = pdfmetrics.getFont(font).face
+    asc = face.ascent / 1000.0            # em above baseline (Helvetica .718)
+    desc = -face.descent / 1000.0         # em below baseline (.207)
+    pad = pad_mm * MM
+
+    def fits(size, lines):
+        line_h = size * 1.30
+        block = (len(lines) - 1) * line_h + size * (asc + desc)
+        # FIT_EPS: a caller that sizes its band from this very measurement
+        # lands on the boundary exactly, and float noise would otherwise
+        # report a cut-off that is not there.
+        return block <= (box_top - box_bot) - 2 * pad + FIT_EPS
+
+    # start at the maximum size; shrink until the wrapped text fits
+    tsize = float(max_size)
+    lines = wrap_text(text, font, tsize, width)
+    while not fits(tsize, lines) and tsize > min_size:
+        tsize -= 0.5
+        lines = wrap_text(text, font, tsize, width)
+
+    # even at the minimum size the text may overflow (huge rules text):
+    # keep only as many lines as fit and visibly cut the last one
+    if not fits(tsize, lines):
+        line_h0 = tsize * 1.30
+        avail = (box_top - box_bot) - 2 * pad
+        max_lines = max(int((avail - tsize * (asc + desc)) // line_h0) + 1, 1)
+        kept = lines[:max_lines]
+        last = truncate_to_fit(kept[-1], font, tsize, width)
+        if last == kept[-1]:
+            last = kept[-1].rstrip() + '\u2026'   # still too wide: force a cut
+        kept[-1] = last
+        lines = kept
+        if truncated is not None:
+            truncated.append(('rules text cut off', name))
+
+    # center the whole block vertically between the two rules
+    line_h = tsize * 1.30
+    block = (len(lines) - 1) * line_h + tsize * (asc + desc)
+    first_baseline = box_top - (box_top - box_bot - block) / 2.0 \
+                     - asc * tsize
+
+    c.setFont(font, tsize)
+    for i, ln in enumerate(lines):
+        ty = first_baseline - i * line_h
+        c.drawString(lx, ty, ln)   # left-justified
+    return tsize
+
+
+def draw_mini_face(c, x, y, w, h, data, scale=HALF_SCALE, warnings=None):
+    """Draw a scaled-down card face inside the rect (x, y, w, h).
+
+    Used for the two halves of split/flip cards: no border is drawn here, the
+    halves share the one bordered card face and are separated by a rule.  The
+    standard zone proportions are kept but scaled to this half's height, and
+    fonts use *scale* so they stay legible on a test-play card.
+    """
+    top = y + h
+    h_mm = h / MM
+    # Absolute zone offsets from the half's own top edge (a scaled copy of the
+    # standard zones collapses to nothing on a 40 mm half).  If the half is
+    # unusually short, squeeze the band positions proportionally.
+    k = min(1.0, max(h_mm - MINI_TEXT_BOT - 2 * MINI_NAME_LINE,
+                     MINI_TYPE_TOP) / (MINI_TYPE_TOP - MINI_NAME_LINE))
+    y_name = MINI_NAME_LINE
+    y_ttop = MINI_NAME_LINE + (MINI_TYPE_TOP - MINI_NAME_LINE) * k
+    y_tbot = MINI_NAME_LINE + (MINI_TYPE_BOT - MINI_NAME_LINE) * k
+    y_text_bot = h_mm - max(MINI_TEXT_BOT, 1.0)
+
+    def H(y_mm):
+        return top - y_mm * MM
+
+    def rule(y_mm):
+        c.setLineWidth(LINE_W)
+        c.line(x + MARGIN_MM * MM, H(y_mm), x + w - MARGIN_MM * MM, H(y_mm))
+
+    lx = x + PAD_X
+    lw = w - 2 * PAD_X
+
+    # --- name row (name left, mana cost right) -----------------------------
+    name = data['name']
+    cost = clean_mana_cost(data.get('mana_cost') or '')
+    nsize, csize, ntext = fit_name_cost(name, cost, lw)
+    _note_short_name(warnings, name, ntext)
+    band_top = top - BORDER_W
+    band_bot = H(Z_NAME_LINE)
+    band_mid = (band_top + band_bot) / 2.0
+
+    def _base(size, font):
+        face = pdfmetrics.getFont(font).face
+        asc = face.ascent / 1000.0
+        desc = -face.descent / 1000.0
+        return band_mid - (asc - desc) * size / 2.0 - NAME_DROP
+
+    nsize = min(nsize, NAME_SIZE * scale)
+    c.setFont(NAME_FONT, nsize)
+    c.drawString(lx, _base(nsize, NAME_FONT), ntext)
+    if cost:
+        csize = min(csize, COST_SIZE * scale)
+        c.setFont(COST_FONT, csize)
+        c.drawRightString(x + w - PAD_X, _base(csize, COST_FONT), cost)
+    rule(y_name)
+
+    # --- blank art band, then the type line --------------------------------
+    rule(y_ttop)
+    tline = data.get('type_line') or ''
+    if tline:
+        tsize = fit_font_size(tline, TYPE_FONT, TYPE_SIZE * scale, MIN_TEXT, lw)
+        c.setFont(TYPE_FONT, tsize)
+        face = pdfmetrics.getFont(TYPE_FONT).face
+        asc = face.ascent / 1000.0
+        desc = -face.descent / 1000.0
+        b_top, b_bot = H(y_ttop), H(y_tbot)
+        tbase = (b_top + b_bot) / 2.0 - (asc - desc) * tsize / 2.0 - TYPE_DROP
+        c.drawString(lx, tbase, tline)
+    rule(y_tbot)
+
+    # --- the half's own rules-text box -------------------------------------
+    if data.get('oracle_text'):
+        draw_text_block(c, lx, lw, H(y_tbot), H(y_text_bot),
+                        data['oracle_text'], name, warnings,
+                        max_size=TEXT_SIZE * scale, min_size=MIN_TEXT)
+
+    # --- stat line of this half (bottom right) -----------------------------
+    stat = _stat_text(data)
+    if stat:
+        ssize = fit_font_size(stat, STAT_FONT, STAT_SIZE * scale, MIN_TEXT, lw)
+        c.setFont(STAT_FONT, ssize)
+        c.drawRightString(x + w - PAD_X, y + 3.0 * MM * k, stat)
+
+
+def _stat_text(data):
+    """Power/toughness, else starting loyalty, else battle defense, else None."""
+    p, t = data.get('power'), data.get('toughness')
+    if p is not None or t is not None:
+        return f'{p if p is not None else "*"}/{t if t is not None else "*"}'
+    for key in ('loyalty', 'defense'):
+        if data.get(key) is not None:
+            return str(data[key])
+    return None
+
+
+def _draw_half_pair(c, x, y, item, truncated=None):
+    """Split / flip frame: ONE bordered face, two spells, lower half upside down.
+
+    This mirrors how real split and flip cards are printed: the second spell
+    sits on the same cardstock turned 180 degrees, so cutting the card out
+    gives one double-ended card rather than two separate ones.
+    """
+    c.saveState()
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setFillColorRGB(0, 0, 0)
+    c.rect(x, y, CARD_W, CARD_H, stroke=0, fill=1)
+    c.setFillColorRGB(1, 1, 1)
+    c.roundRect(x + BORDER_W, y + BORDER_W, CARD_W - 2 * BORDER_W,
+                CARD_H - 2 * BORDER_W, INNER_R * MM, stroke=0, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+
+    bw = BORDER_W
+    div_y = y + CARD_H - HALF_DIVIDER_MM * MM      # divider between the halves
+    c.setLineWidth(LINE_W)
+    c.line(x + MARGIN_MM * MM, div_y,
+           x + CARD_W - MARGIN_MM * MM, div_y)
+
+    h_up = (y + CARD_H - bw) - div_y
+    h_lo = div_y - (y + bw)
+    parts = item.get('parts') or []
+    if parts:
+        draw_mini_face(c, x + bw, div_y, CARD_W - 2 * bw, h_up,
+                       parts[0], HALF_SCALE, truncated)
+    if len(parts) > 1:
+        # the lower spell is printed upside down on the same face
+        c.saveState()
+        cx, cy = x + CARD_W / 2.0, y + bw + h_lo / 2.0
+        c.translate(cx, cy)
+        c.rotate(180)
+        draw_mini_face(c, -(CARD_W - 2 * bw) / 2.0, -h_lo / 2.0,
+                       CARD_W - 2 * bw, h_lo, parts[1], HALF_SCALE, truncated)
+        c.restoreState()
+    c.restoreState()
+
+
+def _draw_panel_boxes(c, x_left, width, box_top, box_bot, panels, name,
+                      truncated=None):
+    """Divide the standard text box into the stacked sub-boxes of a real card.
+
+    *panels* is [(header, body), ...] from split_panels(); each panel gets its
+    own share of the box and its own divider rule, with the header printed in
+    bold above the body.  Shares are sized from the measured wrapped height of
+    every panel (not character counts), and the white above the dividers is
+    spent down to MIN_PANEL_PAD_MM before any text is shrunk, so long sagas,
+    Levels and Cases print every chapter instead of cutting text off.  The
+    bounding rules of the standard text box are still drawn by draw_card,
+    unchanged.
+    """
+    n = len(panels)
+    box_h = box_top - box_bot
+    pad = PANEL_BODY_PAD_MM * MM          # padding inside every sub-box
+
+    def em(font):
+        f = pdfmetrics.getFont(font).face
+        return f.ascent / 1000.0, -f.descent / 1000.0
+
+    # (header text, header size, header height, largest body size) per panel
+    spec = []
+    for head, body in panels:
+        if head:
+            hsize = fit_font_size(head, NAME_FONT, TEXT_SIZE * PANEL_HDR_SCALE,
+                                  MIN_TEXT, width)
+            asc, desc = em(NAME_FONT)
+            spec.append((head, hsize, hsize * (asc + desc) +
+                         PANEL_HDR_EXTRA_MM * MM, TEXT_SIZE * 0.92))
+        else:
+            spec.append(('', None, 0.0, TEXT_SIZE))
+
+    # Band height each panel needs at its current body size: header plus the
+    # wrapped body block plus that renderer's own padding (draw_text_block
+    # measures a block as (lines - 1) * 1.30 * size + ascent + descent).
+    sizes = [s[3] for s in spec]
+
+    def need(k):
+        head_txt, hsize, hdr_h, _ = spec[k]
+        body = panels[k][1]
+        if not body:
+            return hdr_h + 2 * pad
+        asc, desc = em(TEXT_FONT)
+        lines = wrap_text(body, TEXT_FONT, sizes[k], width)
+        block = (len(lines) - 1) * sizes[k] * 1.30 + sizes[k] * (asc + desc)
+        return hdr_h + block + 2 * pad
+
+    need_h = [need(k) for k in range(n)]
+
+    # The white above each divider is the flexible resource: use as much of it
+    # as fits (up to PANEL_PAD_MM) before shrinking any text.  Only when even
+    # the minimum white cannot hold the stack do panels shrink, down to MIN_TEXT
+    # and, if that still fails, a visible cut.
+    gap = PANEL_PAD_MM * MM
+    while True:
+        free = box_h - sum(need_h)
+        want = free / (n - 1) if n > 1 else PANEL_PAD_MM * MM
+        gap = min(max(want, MIN_PANEL_PAD_MM * MM), PANEL_PAD_MM * MM)
+        if sum(need_h) + gap * (n - 1) <= box_h:
+            break
+        k = max(range(n), key=lambda i: (sizes[i], need_h[i]))
+        if sizes[k] <= MIN_TEXT:
+            break           # nothing left to shrink: draw_text_block cuts
+        sizes[k] -= 0.5
+        need_h[k] = need(k)
+    avail = box_h - gap * (n - 1)
+
+    total_h = sum(need_h) or 1.0
+    slack = max(avail - total_h, 0.0)
+
+    top_i = box_top
+    for k, (head, body) in enumerate(panels):
+        head_txt, hsize, hdr_h, _ = spec[k]
+        share = need_h[k] + slack * need_h[k] / total_h
+        bot_i = box_bot if k == n - 1 else top_i - share
+        if head_txt:
+            asc, desc = em(NAME_FONT)
+            c.setFont(NAME_FONT, hsize)
+            c.drawString(x_left, top_i - asc * hsize - 0.3 * MM, head_txt)
+            if body:
+                draw_text_block(c, x_left, width, top_i - hdr_h, bot_i, body,
+                                name, truncated, max_size=sizes[k],
+                                min_size=MIN_TEXT, pad_mm=PANEL_BODY_PAD_MM)
+        elif body:
+            draw_text_block(c, x_left, width, top_i, bot_i, body, name,
+                            truncated, max_size=sizes[k], min_size=MIN_TEXT,
+                            pad_mm=PANEL_BODY_PAD_MM)
+        if k + 1 < n:
+            c.setLineWidth(LINE_W)
+            c.line(x_left, bot_i - gap / 2.0, x_left + width,
+                   bot_i - gap / 2.0)
+        top_i = bot_i - gap
+
+
+def _draw_inset_panel(c, x0, y0, w, h, data, warnings=None):
+    """Adventure / Prepared sub-panel: a bordered box inside the text box."""
+    c.saveState()
+    c.setFillColorRGB(1, 1, 1)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(LINE_W)
+    c.roundRect(x0, y0, w, h, 1.0 * MM, stroke=1, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+
+    pad = 1.2 * MM
+    ix, iw = x0 + pad, w - 2 * pad
+    top_i, bot_i = y0 + h - pad, y0 + pad
+
+    # header band: name left, mana cost right (like a mini card header)
+    cost = clean_mana_cost(data.get('mana_cost') or '')
+    nsize, csize, ntext = fit_name_cost(data['name'], cost, iw)
+    _note_short_name(warnings, data['name'], ntext)
+    nsize = min(nsize, NAME_SIZE * INSET_SCALE)
+    face = pdfmetrics.getFont(NAME_FONT).face
+    asc = face.ascent / 1000.0
+    desc = -face.descent / 1000.0
+    hdr_h = (top_i - bot_i) * 0.34
+    base = top_i - (hdr_h - nsize * (asc + desc)) / 2.0 - asc * nsize
+    c.setFont(NAME_FONT, nsize)
+    c.drawString(ix, base, ntext)
+    if cost:
+        c.setFont(COST_FONT, min(csize or COST_SIZE, COST_SIZE * INSET_SCALE))
+        c.drawRightString(ix + iw, base, cost)
+    top_i -= hdr_h + 0.6 * MM
+
+    tline = data.get('type_line') or ''
+    if tline:
+        tsize = fit_font_size(tline, TYPE_FONT, TYPE_SIZE * INSET_SCALE,
+                              MIN_TEXT, iw)
+        face = pdfmetrics.getFont(TYPE_FONT).face
+        asc = face.ascent / 1000.0
+        desc = -face.descent / 1000.0
+        th = tsize * (asc + desc) + 0.8 * MM
+        c.setFont(TYPE_FONT, tsize)
+        c.drawString(ix, top_i - asc * tsize - 0.3 * MM, tline)
+        top_i -= th
+
+    if data.get('oracle_text'):
+        draw_text_block(c, ix, iw, top_i, bot_i, data['oracle_text'],
+                        data['name'], warnings, max_size=TEXT_SIZE * INSET_SCALE,
+                        min_size=MIN_TEXT, pad_mm=0.3)
+    c.restoreState()
 
 
 def draw_card(c, x, y, card, truncated=None):
     """Draw one test-play card. (x, y) = bottom-left corner in points.
 
-    If *truncated* is a list, the card name is appended to it when the
-    rules text was too long for the box and had to be cut off.
+    If *truncated* is a list, a (reason, card name) pair is appended to it
+    when the rules text was too long for the box and had to be cut off, or
+    when the printed name had to be shortened with an ellipsis.
     """
+    if card.get('frame') == 'half':
+        _draw_half_pair(c, x, y, card, truncated)
+        return
+
     top = y + CARD_H
 
     def H(y_mm):  # mm from top -> point coordinate
@@ -639,6 +1273,7 @@ def draw_card(c, x, y, card, truncated=None):
     name = card['name']
     cost = clean_mana_cost(card['mana_cost'])
     nsize, csize, ntext = fit_name_cost(name, cost, lw)
+    _note_short_name(truncated, name, ntext)
     # Baselines centred between the inner border edge and the name rule,
     # matching a real card's top band (name ~3.5-7 mm from the top edge),
     # nudged down a touch so the text doesn't crowd the thick border.
@@ -677,68 +1312,25 @@ def draw_card(c, x, y, card, truncated=None):
 
     rule(Z_TYPE_BOT)
 
-    # --- text box: left-justified, vertically centered ----------------------
-    text = card['oracle_text']
-    if text:
-        face = pdfmetrics.getFont(TEXT_FONT).face
-        asc = face.ascent / 1000.0            # em above baseline (Helvetica .718)
-        desc = -face.descent / 1000.0         # em below baseline (.207)
-        box_top = H(Z_TYPE_BOT)               # rule above the text box
-        box_bot = H(Z_TEXT_BOT)               # rule below the text box
-
-        # keep a little padding between the text and the rules bounding
-        # the box, even when the text nearly fills it
-        pad = 1.0 * MM
-
-        def fits(size, lines):
-            line_h = size * 1.30
-            block = (len(lines) - 1) * line_h + size * (asc + desc)
-            return block <= (box_top - box_bot) - 2 * pad
-
-        # start at the maximum size; shrink until the wrapped text fits
-        tsize = float(TEXT_SIZE)
-        lines = wrap_text(text, TEXT_FONT, tsize, lw)
-        while not fits(tsize, lines) and tsize > MIN_TEXT:
-            tsize -= 0.5
-            lines = wrap_text(text, TEXT_FONT, tsize, lw)
-
-        # even at the minimum size the text may overflow (huge rules text):
-        # keep only as many lines as fit and visibly cut the last one
-        if not fits(tsize, lines):
-            line_h0 = tsize * 1.30
-            avail = (box_top - box_bot) - 2 * pad
-            max_lines = max(int((avail - tsize * (asc + desc)) // line_h0) + 1, 1)
-            kept = lines[:max_lines]
-            last = truncate_to_fit(kept[-1], TEXT_FONT, tsize, lw)
-            if last == kept[-1]:
-                last = kept[-1].rstrip() + '\u2026'   # still too wide: force a cut
-            kept[-1] = last
-            lines = kept
-            if truncated is not None:
-                truncated.append(card['name'])
-
-        # center the whole block vertically between the two rules
-        line_h = tsize * 1.30
-        block = (len(lines) - 1) * line_h + tsize * (asc + desc)
-        first_baseline = box_top - (box_top - box_bot - block) / 2.0 \
-                         - asc * tsize
-
-        c.setFont(TEXT_FONT, tsize)
-        for i, ln in enumerate(lines):
-            ty = first_baseline - i * line_h
-            c.drawString(lx, ty, ln)   # left-justified
+    # --- text box: word-wrapped, vertically centered -----------------------
+    # The standard renderer (draw_text_block) and the standard zone bounds are
+    # used unchanged for every card.  Custom frames only change what happens
+    # inside this box: stacked sub-boxes (leveler / class / case / saga) or a
+    # reserved strip at the bottom for an Adventure / Prepared inset panel.
+    if card.get('panels'):
+        _draw_panel_boxes(c, lx, lw, H(Z_TYPE_BOT), H(Z_TEXT_BOT),
+                          card['panels'], name, truncated)
+    else:
+        bot_mm = (Z_TEXT_BOT - INSET_H_MM) if card.get('inset') else Z_TEXT_BOT
+        if card['oracle_text']:
+            draw_text_block(c, lx, lw, H(Z_TYPE_BOT), H(bot_mm),
+                            card['oracle_text'], name, truncated)
 
     rule(Z_TEXT_BOT)
 
     # --- stat line (power/toughness, or starting loyalty for
     #     planeswalkers; bottom right) ---------------------------------------
-    p, t = card['power'], card['toughness']
-    if p is not None or t is not None:
-        stat = f'{p if p is not None else "*"}/{t if t is not None else "*"}'
-    elif card.get('loyalty') is not None:
-        stat = str(card['loyalty'])
-    else:
-        stat = None
+    stat = _stat_text(card)
     if stat:
         ssize = fit_font_size(stat, STAT_FONT, STAT_SIZE, MIN_TEXT, lw)
         c.setFont(STAT_FONT, ssize)
@@ -757,14 +1349,26 @@ def draw_card(c, x, y, card, truncated=None):
         c.setFont(NAME_FONT, MIN_TEXT)
         c.drawRightString(x + CARD_W - PAD_X, H(Z_NAME_LINE) - 4.0, tag)
 
+    # --- Adventure / Prepared inset sub-panel -------------------------------
+    # Sits in the strip that was reserved at the bottom-left of the text box,
+    # so it can never cover the main spell's rules text.
+    if card.get('inset'):
+        gap = 1.0 * MM
+        _draw_inset_panel(c, x + PAD_X,
+                          H(Z_TEXT_BOT) + gap,
+                          INSET_W_MM * MM,
+                          INSET_H_MM * MM - 2 * gap,
+                          card['inset'], truncated)
+
     c.restoreState()
 
 
 def build_pdf(cards, paper_pt, out_path):
     """Render all cards to a PDF.
 
-    Returns (pages, per_page, truncated) where *truncated* lists the names
-    of cards whose rules text was too long and got cut off.
+    Returns (pages, per_page, warnings) where each entry of *warnings* is a
+    (reason, card name) pair: 'rules text cut off' when the text overflowed
+    the box at MIN_TEXT, 'name shortened' when the name row needed one.
     """
     paper_w, paper_h = paper_pt
     cols, rows, ox, oy = compute_grid(paper_w, paper_h)
@@ -806,16 +1410,20 @@ class App:
         top = ttk.Frame(root, padding=10)
         top.pack(fill='x')
 
+        prefs = load_settings()
+
         ttk.Label(top, text='Paper size:').pack(side='left')
-        self.paper_var = tk.StringVar(value=list(PAPER_SIZES)[0])
+        self.paper_var = tk.StringVar(
+            value=prefs.get('paper_size', list(PAPER_SIZES)[0]))
         self.paper_cb = ttk.Combobox(
             top, textvariable=self.paper_var,
-            values=list(PAPER_SIZES), state='readonly', width=24)
+            values=list(PAPER_SIZES), width=24)
         self.paper_cb.pack(side='left', padx=(6, 18))
 
         ttk.Label(top, text='Output:').pack(side='left')
-        self.out_var = tk.StringVar(value=os.path.join(
-            downloads_dir(), 'mtg_test_cards.pdf'))
+        self.out_var = tk.StringVar(value=prefs.get(
+            'output_path') or os.path.join(
+                downloads_dir(), 'mtg_test_cards.pdf'))
         ttk.Entry(top, textvariable=self.out_var, width=42).pack(side='left', padx=(6, 10))
         ttk.Button(top, text='Browse...', command=self.choose_output).pack(side='left')
 
@@ -870,7 +1478,9 @@ class App:
     def _preload_db(self):
         try:
             ensure_database()
-            self.db = load_database()
+            with _parse_lock:      # same lock as the worker: parse once
+                if self.db is None:
+                    self.db = load_database()
             self._set_status(f'Ready. Scryfall database loaded '
                              f'({len(self.db):,} cards).')
         except Exception as e:
@@ -914,13 +1524,20 @@ class App:
             cards, problems = resolve(entries, self.db)
             problems = parse_errors + problems
 
+            # A huge per-line quantity is legal but turns into a long stack of
+            # sheets; say so rather than surprising the user with 100 pages.
+            qty_notes = [f'line {ln}: x{q} copies'
+                         for ln, q, _name in entries if q > QTY_NOTE_ABOVE]
+
             if not cards:
                 raise RuntimeError(
                     'No valid cards to print.\n\n' + '\n'.join(problems))
 
-            # Split two-faced cards into one item per face and add meld
-            # results, so every physical card side gets its own test card.
-            items = expand_items(cards, self.db)
+            # Layout-driven expansion: only genuinely double-sided cards yield
+            # two items; split/flip/adventure/prepare stay on one face with a
+            # custom frame (see expand_items).
+            notes = []
+            items = expand_items(cards, self.db, notes)
 
             out_path = self.out_var.get().strip()
             if not out_path:
@@ -938,22 +1555,46 @@ class App:
                     f"The folder '{parent}' does not exist - pick a valid "
                     'output path.')
 
+            paper_name = self.paper_var.get()
+            if paper_name not in PAPER_SIZES:
+                raise RuntimeError(
+                    f"'{paper_name}' is not one of the listed paper sizes - "
+                    'pick one from the Paper size drop-down.')
+
             existed = os.path.isfile(out_path)
-            pages, per_page, truncated = build_pdf(
-                items, PAPER_SIZES[self.paper_var.get()], out_path)
+            pages, per_page, warnings = build_pdf(
+                items, PAPER_SIZES[paper_name], out_path)
+            save_settings(paper_name, out_path)  # remembered for next launch
 
             msg = (f'Wrote {out_path}\n{len(cards)} card(s), '
-                   f'{len(items)} face(s) on {pages} page(s) ({per_page}/page).')
+                   f'{len(items)} face(s) on {pages} page(s) '
+                   f'({per_page}/page). Print at 100% scale for the real '
+                   f'{CARD_W / MM:.2f} x {CARD_H / MM:.2f} mm card size.')
             if existed:
                 msg += (f'\nNote: this replaced an existing file at '
                         f'{out_path}.')
             if problems:
                 msg += ('\n\nSome lines could not be resolved:\n' +
                         '\n'.join(problems))
-            if truncated:
-                names = ', '.join(dict.fromkeys(truncated))
-                msg += ('\n\nNote: the rules text was longer than the card '
-                        f'box and was cut off on: {names}.')
+            if notes:
+                msg += ('\n\nLayout notes:\n' + '\n'.join(
+                    dict.fromkeys(notes)))
+            if qty_notes:
+                msg += ('\n\nLarge quantities requested (expect many pages):\n'
+                        + '; '.join(qty_notes) + '.')
+            for reason in ('rules text cut off', 'name shortened'):
+                names = [n for kind, n in warnings if kind == reason]
+                if not names:
+                    continue
+                if reason == 'rules text cut off':
+                    msg += ('\n\nNote: the rules text was longer than the card '
+                            'box and was cut off on: ' +
+                            ', '.join(dict.fromkeys(names)) + '.')
+                else:
+                    msg += ('\n\nNote: these names were too long to print in '
+                            'full at the 6 pt floor and were shortened with an '
+                            'ellipsis: ' +
+                            ', '.join(dict.fromkeys(names)) + '.')
             self.root.after(0, lambda: (
                 self.status.config(text=f'Done - {len(items)} card face(s) '
                                         f'on {pages} page(s).'),
