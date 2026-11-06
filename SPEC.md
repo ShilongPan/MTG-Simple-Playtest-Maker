@@ -91,7 +91,15 @@ matches and several cards share it, the first listing wins and a note names the
 others (closes REVIEW.md 1.2/1.3). If no card carries the typed name, the face
 names of multi-face cards are tried, so typing the front half alone (`Ulvenwald
 Captive`) still prints the whole card — a standalone card of that name always
-wins over a same-named face. Unresolved entries produce a problem string
+wins over a same-named face. Art (art-series) printings never answer a name
+search: `load_database()` flags them with `art_card` (`layout == 'art_series'`,
+`frame == 'art'` or `set_type == 'art_series'` - 2,411 of the 39,287 records,
+in 45 sets named "… Art Series"), `_face_index()` skips them and `_real_cards()`
+filters every main-index hit, so `Hobgoblin` finds nothing instead of the art
+print of *Minion of the Mighty* and a back-face name (`Ashen Reaper`) finds
+Invasion of Azgol rather than its art twin; an art print is still printable when
+typed by its exact full name (`Hobgoblin Bandit Lord // Hobgoblin`), which keeps
+the `ART SERIES` frame reachable. Unresolved entries produce a problem string
 `line N: “name” (xQ): no card with this name was found…`. Spelling help: a name
 that matched neither the main index nor any face name gets up to `SUGGEST_MAX = 4`
 nearest names appended as ` Did you mean "X", "Y"?` by `_suggest_names()` /
@@ -163,8 +171,19 @@ ONE piece of cardstock. `expand_items()` maps layout → printed items + frame:
 
 | Layout(s) | Items | Frame |
 |---|---|---|
-| `transform`, `modal_dfc`, `double_faced_token`, `art_series`, `reversible_card` (`DOUBLE_SIDED_LAYOUTS`) | **2**, tagged FRONT/BACK | standard; `TOKEN` marker for two-faced tokens, `ART SERIES` marker and a blank type line for art cards; > 2 nested faces print the first two plus a layout note. An `ART SERIES` face prints its name and nothing else (`oracle_text` is empty in Scryfall for these): the blank text box is genuine, not lost text, and such faces are never reported as truncated |
-| `split`, `flip` (`HALF_FACE_LAYOUTS`) | 1 (or `len(faces)` when > 2) | **half**: both spells on the one bordered face, divided by a rule at `HALF_DIVIDER_MM = 44.0`; each half drawn by `draw_mini_face` with its own absolute zone offsets (`MINI_NAME_LINE = 8.0`, `MINI_TYPE_TOP = 23.5`, `MINI_TYPE_BOT = 29.5`, `MINI_TEXT_BOT = 1.5`) and fonts scaled by `HALF_SCALE = 0.62`; the lower half is rotated 180° like a real split/flip card. The authentic frame holds *exactly* two spells, so a card with more halves (the joke set `Smelt // Herd // Saw`, `Who // What // When // Where // Why`) instead prints one standard card per spell, each marked `SPLIT i/n` / `FLIP i/n` and tagged `i/n`; the extra spells are never dropped silently, only reflowed |
+| `transform`, `modal_dfc`, `double_faced_token`, `art_series`, `reversible_card` (`DOUBLE_SIDED_LAYOUTS`) | **2**, tagged FRONT/BACK | standard; `TOKEN` marker for two-faced tokens, `ART SERIES` marker and a blank type line for art cards; > 2 nested faces print the first two plus a layout note. An `ART SERIES` face prints its name and nothing else (`oracle_text` is empty in Scryfall for these): the blank text box is genuine, not lost text, and such faces are never reported as truncated; a bare name search never picks one
+up, see §5 |
+| `split`, `flip` (`HALF_FACE_LAYOUTS`) | 1 (or `len(faces)` when > 2) | **half**: both spells on the one bordered face, divided by a rule at `HALF_DIVIDER_MM = 44.0`; each half drawn by `draw_mini_face` with its own absolute zone offsets (`MINI_NAME_LINE = 8.0`, `MINI_TYPE_TOP = 23.5`, `MINI_TYPE_BOT = 29.5`, `MINI_TEXT_BOT = 1.5`) and fonts scaled by `HALF_SCALE = 0.62`; the lower half is rotated 180° like a real split/flip card. A `flip` card's
+halves are additionally tagged `FRONT` / `BACK` bottom-left inside each half
+(`draw_mini_face(tag=...)`) because the game really turns that card over, and
+every half prints its own stat line from its own face record: a flip back is a
+different creature (*Nezumi Graverobber* 2/1 → *Nighteyes the Desecrator* 4/2,
+*Curse of the Fire Penguin* → *Curse of the Fire Penguin Creature* 6/5) and the
+back of a double-faced planeswalker carries its starting loyalty counter (*Ral,
+Monsoon Mage* 1/3 → *Ral, Leyline Prodigy* 2), so `_stat_text()` is fed the face
+dict, never the parent card. The half's stat baseline is clamped to
+`max(y + MINI_TEXT_BOT * MM, y + 3.0 * MM * k)` so a short half cannot push the
+numbers into its rules text or the border. The authentic frame holds *exactly* two spells, so a card with more halves (the joke set `Smelt // Herd // Saw`, `Who // What // When // Where // Why`) instead prints one standard card per spell, each marked `SPLIT i/n` / `FLIP i/n` and tagged `i/n`; the extra spells are never dropped silently, only reflowed |
 | `adventure`, `prepare` (`INSET_PANEL_LAYOUTS`) | 1 | standard + inset: main spell as usual, Adventure/Prepared spell in an `INSET_W_MM × INSET_H_MM = 34 × 18` mm rounded box at the bottom-left of the text box (`_draw_inset_panel`, fonts × `INSET_SCALE = 0.70`); the main text box's bottom is raised so nothing overlaps |
 | `leveler`, `class`, `case`, `saga` (`STACKED_PANEL_LAYOUTS`) | 1 | **panels**: `split_panels()` cuts the rules text into sub-boxes at `_PANEL_HEADERS` regexes, `_panel_label()` keeps only short labels (`I, II —`, `To solve —`, `LEVEL 2+`) bold and folds the rest into wrapped body text; `_draw_panel_boxes` measures every panel's true wrapped height (header plus body block, exactly as `draw_text_block` measures it) and sizes each share from that measurement — the white above the dividers is spent down from `PANEL_PAD_MM = 1.2` mm to `MIN_PANEL_PAD_MM = 0.5` mm *before* any text shrinks, so a three-chapter card prints every chapter instead of losing text; headers at × `PANEL_HDR_SCALE = 0.80` with `PANEL_HDR_EXTRA_MM = 0.4` mm under them, bodies padded `PANEL_BODY_PAD_MM = 0.3` mm, separated by 1 pt rules |
 | `meld` | part → 2 (MELD PART then MELD RESULT via its `meld_result`); result alone → 1 | standard + marker; the auto-added result prints at most once per run — both halves of a meld pair name the same result, and typing that result card yourself counts as the copy — so no face is duplicated; a missing partner emits a layout note |

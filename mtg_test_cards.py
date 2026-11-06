@@ -150,6 +150,7 @@ Z_TEXT_BOT = 79.4      # rule below the text box (top of the stat zone)
 # stat zone: Z_TEXT_BOT .. (88 - MARGIN_MM)
 PAD_X = (MARGIN_MM + 0.4) * MM   # horizontal padding for text inside the border
 LINE_W = 1.0           # pt, weight of the separating rules
+FACE_TAG_GAP = 1.5     # pt: white above the FRONT / BACK tag, under the name rule
 
 # ---------------------------------------------------------------------------
 # Card layouts (https://scryfall.com/docs/api/layouts)
@@ -329,6 +330,18 @@ def _norm(name):
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
 
+def _real_cards(cands):
+    """Drop art (art-series) listings from a list of candidate cards.
+
+    A typed name never means an art card: 'Hobgoblin' should not resolve to
+    the Kaldheim art print 'Minion of the Mighty // Kobold', and typing a
+    back face ('Ashen Reaper') must find the real Invasion of Azgol, not its
+    art-series twin. Art prints stay reachable only through an exact full
+    typing ('Minion of the Mighty // Kobold'), which is what resolve() does.
+    """
+    return [c for c in cands if not c.get('art_card')]
+
+
 def load_database(path=CACHE_PATH):
     """Load the JSONL cache into {normalized_name: [card, ...]}.
 
@@ -363,6 +376,13 @@ def load_database(path=CACHE_PATH):
                 'defense': c.get('defense'),
                 'oracle_text': (c.get('oracle_text') or '').strip(),
                 'layout': c.get('layout') or 'normal',
+                # Art (art-series) printings: art + name only, no cost,
+                # type line or rules text. They are not playable cards,
+                # so name matching must never pick one (they carry the
+                # same names as real cards twice, 'X // X').
+                'art_card': (c.get('layout') == 'art_series' or
+                             c.get('frame') == 'art' or
+                             c.get('set_type') == 'art_series'),
                 # Two-faced cards (split, flip, transform, adventure,
                 # prepare, art_series, two-faced tokens) carry a full copy
                 # of every field per face; single-face cards: empty list.
@@ -400,13 +420,20 @@ _FACE_INDEX = {}
 
 
 def _face_index(db):
-    """Map every face name of a multi-face card to its full card record."""
+    """Map every face name of a multi-face card to its full card record.
+
+    Art-series printings are skipped: they reuse real card names as faces,
+    and being loaded first they would otherwise win the lookup and print a
+    blank art card instead of the real spell.
+    """
     hit = _FACE_INDEX.get(id(db))
     if hit is not None and hit[0] is db:
         return hit[1]
     idx = {}
     for cands in db.values():
         for card in cands:
+            if card.get('art_card'):
+                continue
             for face in card.get('faces') or []:
                 key = _norm(face['name']) or face['name'].casefold()
                 idx.setdefault(key, []).append(card)
@@ -442,7 +469,11 @@ def _name_index(db):
     hit = _NAME_INDEX.get(id(db))
     if hit is not None and hit[0] is db:
         return hit[1]
-    names = {key: cands[0]['name'] for key, cands in db.items()}
+    names = {}                      # art-only keys excluded, see _real_cards
+    for key, cands in db.items():
+        real = _real_cards(cands)
+        if real:
+            names[key] = real[0]['name']
     idx = (list(names), names)
     _NAME_INDEX[id(db)] = (db, idx)
     return idx
@@ -528,10 +559,25 @@ def resolve(entries, db):
     multi-face cards are tried: typing just "Ulvenwald Captive" (the front)
     still finds and prints the whole card. A standalone card with that
     name always wins over a same-named face.
+
+    Art (art-series) printings are ignored by matching: they carry no cost,
+    type line or rules text and duplicate real card names, so 'Hobgoblin'
+    finds nothing rather than the art twin of 'Minion of the Mighty', and a
+    back-face name such as 'Ashen Reaper' finds Invasion of Azgol. An art
+    print is still printable when typed by its exact full name.
     """
     cards, problems = [], []
     for lineno, qty, name in entries:
         cands = db.get(_norm(name)) or db.get(name.casefold())
+        if cands:
+            real = _real_cards(cands)
+            if not real:
+                # Only art prints carry this name: allow it on an exact
+                # full typing ('Hobgoblin Bandit Lord // Hobgoblin') so the
+                # art frame stays reachable, but never on a bare name.
+                typed = name.casefold()
+                real = [c for c in cands if c['name'].casefold() == typed]
+            cands = real
         if not cands:
             # No card of this name: try matching one face of a
             # multi-face card (front-only names for flip/transform/split).
@@ -729,8 +775,8 @@ def expand_items(cards, db, notes=None):
                 # so print the part first, then the result (front -> back).
                 item['marker'] = 'MELD PART'
                 items.append(item)
-                cands = (db.get(_norm(result_name)) or
-                         db.get(result_name.casefold()))
+                cands = _real_cards(db.get(_norm(result_name)) or
+                                    db.get(result_name.casefold()))
                 if cands and _norm(result_name) not in meld_results | typed_names:
                     # Both halves of a meld pair name the same result; one
                     # physical copy of it is enough.  An explicitly typed
@@ -953,8 +999,13 @@ def draw_text_block(c, lx, width, box_top, box_bot, text, name,
     return tsize
 
 
-def draw_mini_face(c, x, y, w, h, data, scale=HALF_SCALE, warnings=None):
+def draw_mini_face(c, x, y, w, h, data, scale=HALF_SCALE, warnings=None,
+                   tag=None):
     """Draw a scaled-down card face inside the rect (x, y, w, h).
+
+    *tag* is an optional corner label ('FRONT' / 'BACK') drawn bottom-left
+    inside this half: on a flip card the two halves are different spells and
+    only one of them is the front, so a playtester needs that marked.
 
     Used for the two halves of split/flip cards: no border is drawn here, the
     halves share the one bordered card face and are separated by a rule.  The
@@ -1028,11 +1079,24 @@ def draw_mini_face(c, x, y, w, h, data, scale=HALF_SCALE, warnings=None):
                         max_size=TEXT_SIZE * scale, min_size=MIN_TEXT)
 
     # --- stat line of this half (bottom right) -----------------------------
+    # Every face carries its OWN power/toughness, loyalty and defense, so a
+    # flip card's back ('Nezumi Graverobber' 2/1 -> 'Nighteyes the Desecrator'
+    # 4/2) prints its own numbers, and the back of a double-faced planeswalker
+    # ('Ral, Monsoon Mage // Ral, Leyline Prodigy') prints its starting
+    # loyalty counter - _stat_text() reads this face dict, never the parent.
+    # The baseline is clamped above this half's own bottom padding so short
+    # halves cannot push the numbers into the rules text or the border.
     stat = _stat_text(data)
     if stat:
         ssize = fit_font_size(stat, STAT_FONT, STAT_SIZE * scale, MIN_TEXT, lw)
         c.setFont(STAT_FONT, ssize)
-        c.drawRightString(x + w - PAD_X, y + 3.0 * MM * k, stat)
+        c.drawRightString(x + w - PAD_X,
+                          max(y + MINI_TEXT_BOT * MM, y + 3.0 * MM * k), stat)
+
+    # --- front/back label of this half (bottom left) -----------------------
+    if tag:
+        c.setFont(NAME_FONT, MIN_TEXT)
+        c.drawString(x + PAD_X, y + 1.0 * MM, tag)
 
 
 def _stat_text(data):
@@ -1071,9 +1135,13 @@ def _draw_half_pair(c, x, y, item, truncated=None):
     h_up = (y + CARD_H - bw) - div_y
     h_lo = div_y - (y + bw)
     parts = item.get('parts') or []
+    # A flip card's halves really are its front and back (the game flips the
+    # card over), so label them; a split card has both spells on one face and
+    # needs no such tag.
+    tags = ('FRONT', 'BACK') if item.get('layout') == 'flip' else (None, None)
     if parts:
         draw_mini_face(c, x + bw, div_y, CARD_W - 2 * bw, h_up,
-                       parts[0], HALF_SCALE, truncated)
+                       parts[0], HALF_SCALE, truncated, tags[0])
     if len(parts) > 1:
         # the lower spell is printed upside down on the same face
         c.saveState()
@@ -1081,7 +1149,8 @@ def _draw_half_pair(c, x, y, item, truncated=None):
         c.translate(cx, cy)
         c.rotate(180)
         draw_mini_face(c, -(CARD_W - 2 * bw) / 2.0, -h_lo / 2.0,
-                       CARD_W - 2 * bw, h_lo, parts[1], HALF_SCALE, truncated)
+                       CARD_W - 2 * bw, h_lo, parts[1], HALF_SCALE, truncated,
+                       tags[1])
         c.restoreState()
     c.restoreState()
 
@@ -1338,8 +1407,8 @@ def draw_card(c, x, y, card, truncated=None):
 
     # --- small corner labels (optional) -------------------------------------
     # TOKEN / DECK INDICATOR / MELD PART / MELD RESULT sit bottom-left on
-    # the stat line's baseline; FRONT / BACK sits just under the name rule,
-    # right-aligned in the blank art band.
+    # the stat line's baseline; FRONT / BACK sits under the name rule,
+    # right-aligned in the blank art band, kept clear of that rule's stroke.
     marker = card.get('marker')
     if marker:
         c.setFont(NAME_FONT, MIN_TEXT)
@@ -1347,7 +1416,13 @@ def draw_card(c, x, y, card, truncated=None):
     tag = card.get('face_tag')
     if tag:
         c.setFont(NAME_FONT, MIN_TEXT)
-        c.drawRightString(x + CARD_W - PAD_X, H(Z_NAME_LINE) - 4.0, tag)
+        # Baseline so the cap tops sit FACE_TAG_GAP below the name rule: the
+        # rule's own half-stroke is counted, which a flat 4.0 pt drop was not,
+        # and that let the caps clip into the line.
+        asc = pdfmetrics.getFont(NAME_FONT).face.ascent / 1000.0
+        c.drawRightString(x + CARD_W - PAD_X,
+                          H(Z_NAME_LINE) - LINE_W / 2.0 - FACE_TAG_GAP
+                          - asc * MIN_TEXT, tag)
 
     # --- Adventure / Prepared inset sub-panel -------------------------------
     # Sits in the strip that was reserved at the bottom-left of the text box,
